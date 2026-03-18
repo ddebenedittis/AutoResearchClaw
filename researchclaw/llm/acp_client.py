@@ -331,10 +331,12 @@ class ACPClient:
 
             return self._extract_response(result.stdout)
         finally:
-            try:
-                os.unlink(prompt_path)
-            except OSError:
-                pass
+            # NOTE: Do NOT delete the temp file here. When acpx sends
+            # the prompt to a running session (via -s), subprocess.run
+            # returns before the session has read the file, causing a
+            # race condition.  The files are small and in /tmp so the
+            # OS will clean them up.
+            pass
 
     @staticmethod
     def _extract_response(raw_output: str) -> str:

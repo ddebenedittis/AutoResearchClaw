@@ -8,6 +8,10 @@ research:
     - "machine-learning"
   daily_paper_count: 10
   quality_threshold: 4.0
+  max_shortlist: 30       # max papers kept after final ranking pass (default: nan)
+  # Optional batch screening settings in stage 5 - LITERATURE_SCREEN
+  screen_batch_size: 100  # papers per LLM screening batch (nan = no batching, single call) (default: nan)
+  screen_max_workers: 4   # max parallel threads for batch screening
 
 runtime:
   timezone: "America/New_York"

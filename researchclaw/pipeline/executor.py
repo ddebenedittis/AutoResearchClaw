@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time as _time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2288,32 +2289,236 @@ def _execute_literature_screen(
         topic_keywords[:8],
     )
 
+    _MIN_SHORTLIST = 15
     shortlist: list[dict[str, Any]] = []
     if llm is not None:
         _pm = prompts or PromptManager()
         _overlay = _get_evolution_overlay(run_dir, "literature_screen")
-        sp = _pm.for_stage(
-            "literature_screen",
-            evolution_overlay=_overlay,
-            topic=config.research.topic,
-            domains=", ".join(config.research.domains)
-            if config.research.domains
-            else "general",
-            quality_threshold=config.research.quality_threshold,
-            candidates_text=candidates_text,
-        )
-        resp = _chat_with_prompt(
-            llm,
-            sp.system,
-            sp.user,
-            json_mode=sp.json_mode,
-            max_tokens=sp.max_tokens,
-        )
-        payload = _safe_json_loads(resp.content, {})
-        if isinstance(payload, dict) and isinstance(payload.get("shortlist"), list):
-            shortlist = [row for row in payload["shortlist"] if isinstance(row, dict)]
+        batch_size = config.research.screen_batch_size
+        use_batching = not math.isnan(batch_size) and int(batch_size) > 0
+
+        if use_batching:
+            bs = int(batch_size)
+            batches = [
+                filtered_rows[i : i + bs]
+                for i in range(0, len(filtered_rows), bs)
+            ]
+            n_batches = len(batches)
+            max_workers = min(n_batches, config.research.screen_max_workers)
+            logger.info(
+                "Stage 5 LLM screening: dispatching %d batches "
+                "(size %d, workers %d) for %d filtered candidates",
+                n_batches,
+                bs,
+                max_workers,
+                len(filtered_rows),
+            )
+
+            # For ACP, spawn a disposable session per batch so they
+            # can run in parallel (the shared session is single-threaded).
+            from researchclaw.llm.acp_client import ACPClient, ACPConfig
+            is_acp = isinstance(llm, ACPClient)
+
+            def _screen_batch(
+                batch_idx: int, batch: list[dict[str, Any]]
+            ) -> list[dict[str, Any]]:
+                batch_text = "\n".join(
+                    json.dumps(r, ensure_ascii=False) for r in batch
+                )
+                sp = _pm.for_stage(
+                    "literature_screen",
+                    evolution_overlay=_overlay,
+                    topic=config.research.topic,
+                    domains=", ".join(config.research.domains)
+                    if config.research.domains
+                    else "general",
+                    quality_threshold=config.research.quality_threshold,
+                    candidates_text=batch_text,
+                )
+                # Coarse pass: be fast and inclusive
+                user_prompt = (
+                    sp.user
+                    + "\n\nIMPORTANT: This is a coarse screening pass. "
+                    "Be fast and inclusive — keep any paper that is "
+                    "plausibly relevant to the topic. Do not deliberate "
+                    "extensively; a later pass will rank strictly."
+                )
+                # ACP: use a per-batch session for parallelism
+                batch_llm = llm
+                if is_acp:
+                    batch_llm = ACPClient(ACPConfig(
+                        agent=llm.config.agent,
+                        cwd=llm.config.cwd,
+                        acpx_command=llm.config.acpx_command,
+                        session_name=f"{llm.config.session_name}_batch_{batch_idx}",
+                        timeout_sec=llm.config.timeout_sec,
+                    ))
+                try:
+                    resp = _chat_with_prompt(
+                        batch_llm,
+                        sp.system,
+                        user_prompt,
+                        json_mode=sp.json_mode,
+                        max_tokens=sp.max_tokens,
+                    )
+                    payload = _safe_json_loads(resp.content, {})
+                    if isinstance(payload, dict) and isinstance(
+                        payload.get("shortlist"), list
+                    ):
+                        return [
+                            row
+                            for row in payload["shortlist"]
+                            if isinstance(row, dict)
+                        ]
+                    return []
+                finally:
+                    if is_acp and batch_llm is not llm:
+                        batch_llm.close()
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_screen_batch, idx, batch): idx
+                    for idx, batch in enumerate(batches, 1)
+                }
+                for future in as_completed(futures):
+                    batch_idx = futures[future]
+                    try:
+                        batch_result = future.result()
+                        shortlist.extend(batch_result)
+                        logger.info(
+                            "Stage 5 batch %d/%d done — kept %d papers",
+                            batch_idx,
+                            n_batches,
+                            len(batch_result),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Stage 5 batch %d/%d failed, continuing",
+                            batch_idx,
+                            n_batches,
+                            exc_info=True,
+                        )
+
+            # Deduplicate by lowercased title
+            seen_titles: set[str] = set()
+            deduped: list[dict[str, Any]] = []
+            for row in shortlist:
+                t = str(row.get("title", "")).lower().strip()
+                if t and t not in seen_titles:
+                    seen_titles.add(t)
+                    deduped.append(row)
+                elif not t:
+                    deduped.append(row)
+            shortlist = deduped
+            pre_final_count = len(shortlist)
+            logger.info(
+                "Stage 5 batch screening: %d filtered → %d batches → "
+                "%d kept (pre-final-rank)",
+                len(filtered_rows),
+                n_batches,
+                pre_final_count,
+            )
+
+            # Final ranking pass: re-screen aggregated shortlist to
+            # normalise quality across independently-screened batches.
+            if shortlist:
+                try:
+                    agg_text = "\n".join(
+                        json.dumps(r, ensure_ascii=False) for r in shortlist
+                    )
+                    sp = _pm.for_stage(
+                        "literature_screen",
+                        evolution_overlay=_overlay,
+                        topic=config.research.topic,
+                        domains=", ".join(config.research.domains)
+                        if config.research.domains
+                        else "general",
+                        quality_threshold=config.research.quality_threshold,
+                        candidates_text=agg_text,
+                    )
+                    # Final pass: be strict and selective, with a hard cap
+                    max_keep = max(
+                        _MIN_SHORTLIST,
+                        config.research.max_shortlist,
+                    )
+                    user_prompt = (
+                        sp.user
+                        + f"\n\nIMPORTANT: This is the final ranking pass. "
+                        f"These candidates already passed a coarse screen. "
+                        f"Be strict and selective — carefully evaluate each "
+                        f"paper and only keep those that are clearly relevant "
+                        f"and high quality for the research topic. "
+                        f"Return AT MOST {max_keep} papers, ranked by "
+                        f"relevance. Cut ruthlessly."
+                    )
+                    resp = _chat_with_prompt(
+                        llm,
+                        sp.system,
+                        user_prompt,
+                        json_mode=sp.json_mode,
+                        max_tokens=sp.max_tokens,
+                    )
+                    payload = _safe_json_loads(resp.content, {})
+                    if isinstance(payload, dict) and isinstance(
+                        payload.get("shortlist"), list
+                    ):
+                        ranked = [
+                            row
+                            for row in payload["shortlist"]
+                            if isinstance(row, dict)
+                        ]
+                        if ranked:
+                            shortlist = ranked[:max_keep]
+                    # Hard cap even if LLM returned too many
+                    if len(shortlist) > max_keep:
+                        shortlist = shortlist[:max_keep]
+                    logger.info(
+                        "Stage 5 final ranking: %d → %d papers (cap %d)",
+                        pre_final_count,
+                        len(shortlist),
+                        max_keep,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Stage 5 final ranking pass failed, "
+                        "keeping batch-aggregated shortlist",
+                        exc_info=True,
+                    )
+        else:
+            sp = _pm.for_stage(
+                "literature_screen",
+                evolution_overlay=_overlay,
+                topic=config.research.topic,
+                domains=", ".join(config.research.domains)
+                if config.research.domains
+                else "general",
+                quality_threshold=config.research.quality_threshold,
+                candidates_text=candidates_text,
+            )
+            resp = _chat_with_prompt(
+                llm,
+                sp.system,
+                sp.user,
+                json_mode=sp.json_mode,
+                max_tokens=sp.max_tokens,
+            )
+            payload = _safe_json_loads(resp.content, {})
+            if isinstance(payload, dict) and isinstance(
+                payload.get("shortlist"), list
+            ):
+                shortlist = [
+                    row for row in payload["shortlist"] if isinstance(row, dict)
+                ]
+            max_keep = max(_MIN_SHORTLIST, config.research.max_shortlist)
+            if len(shortlist) > max_keep:
+                shortlist = shortlist[:max_keep]
+            logger.info(
+                "Stage 5 LLM screening: %d filtered → 1 batch (no batching) → %d kept (cap %d)",
+                len(filtered_rows),
+                len(shortlist),
+                max_keep,
+            )
     # T2.2: Ensure minimum shortlist size of 15 for adequate related work
-    _MIN_SHORTLIST = 15
     if not shortlist:
         rows = (
             filtered_rows[:_MIN_SHORTLIST]
